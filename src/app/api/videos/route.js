@@ -14,7 +14,7 @@ const sqlConfig = {
   pool: {
     max: 10,
     min: 0,
-    idleTimeoutMillis: 80000
+    idleTimeoutMillis: 100000
   }
 };
 
