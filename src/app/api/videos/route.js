@@ -1,106 +1,112 @@
-// Importamos las herramientas necesarias
 import { NextResponse } from 'next/server';
-import mongoose from 'mongoose';
-import { BlobServiceClient } from '@azure/storage-blob';
+import sql from 'mssql';
 
-// Configuración de la base de datos - Conexión a MongoDB
-const connectDB = async () => {
-  if (mongoose.connection.readyState === 1) return; // Ya está conectado
-  
-  try {
-    await mongoose.connect(process.env.MONGODB_CONNECTION_STRING);
-    console.log('✅ Conectado a MongoDB');
-  } catch (error) {
-    console.error('❌ Error conectando a MongoDB:', error);
+// 🔹 Configuración SQL Server (Azure)
+const sqlConfig = {
+  user: process.env.AZURE_SQL_USER,
+  password: process.env.AZURE_SQL_PASSWORD,
+  server: process.env.AZURE_SQL_SERVER,
+  database: process.env.AZURE_SQL_DATABASE,
+  options: {
+    encrypt: true,
+    trustServerCertificate: false
+  },
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000
   }
 };
 
-// Función para obtener URL de video en Azure Blob Storage
-const getVideoUrl = async (blobName) => {
-  const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
-  const containerName = process.env.AZURE_STORAGE_CONTAINER_NAME || 'videos';
-  
-  const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
-  const containerClient = blobServiceClient.getContainerClient(containerName);
-  const blobClient = containerClient.getBlobClient(blobName);
-  
-  return blobClient.url;
+// 🔹 Pool GLOBAL (NO cerrar por request)
+let pool;
+
+const getPool = async () => {
+  if (!pool) {
+    pool = await sql.connect(sqlConfig);
+    console.log('✅ Conectado a SQL Server');
+  }
+  return pool;
 };
 
-// Esquema de Video - Define la estructura de datos para cada video
-const videoSchema = new mongoose.Schema({
-  videoId: { type: String, required: true, unique: true },
-  title: { type: String, required: true },
-  description: { type: String },
-  creator: { type: String, required: true },
-  blobName: { type: String, required: true },
-  views: { type: Number, default: 0 },
-  uploadedAt: { type: Date, default: Date.now }
-});
+// 🔹 Construir URL SIN Azure SDK
+const buildVideoUrl = (blobName) => {
+  const container = process.env.AZURE_STORAGE_CONTAINER_NAME || 'videos';
+  const account = process.env.AZURE_STORAGE_ACCOUNT_NAME;
 
-// Modelo de Video - Para interactuar con la colección de videos en MongoDB
-const Video = mongoose.models.Video || mongoose.model('Video', videoSchema);
+  if (!account) {
+    return `/videos/${blobName}`;
+  }
 
-/**
- * GET handler - Obtener todos los videos
- * 
- * Flujo completo:
- * 1. Conectar a MongoDB
- * 2. Buscar todos los videos
- * 3. Para cada video, obtener su URL de Azure
- * 4. Devolver todo junto al frontend
- */
-export async function GET(request) {
+  return `https://${account}.blob.core.windows.net/${container}/${blobName}`;
+};
+
+// 🔹 GET /api/videos
+export async function GET() {
   try {
-    // Paso 1: Conectar a la base de datos
-    await connectDB();
-    
-    // Paso 2: Buscar todos los videos en MongoDB, ordenados por fecha (más recientes primero)
-    const videos = await Video.find().sort({ uploadedAt: -1 });
-    
-    // Paso 3: Para cada video, obtener su URL desde Azure Blob Storage
-    const videosWithUrls = await Promise.all(
-      videos.map(async (video) => {
-        try {
-          const url = await getVideoUrl(video.blobName);
-          return {
-            videoId: video.videoId,
-            title: video.title,
-            description: video.description,
-            creator: video.creator,
-            views: video.views,
-            uploadedAt: video.uploadedAt,
-            videoUrl: url
-          };
-        } catch (error) {
-          console.error(`Error obteniendo URL para video ${video.videoId}:`, error);
-          return {
-            videoId: video.videoId,
-            title: video.title,
-            description: video.description,
-            creator: video.creator,
-            views: video.views,
-            uploadedAt: video.uploadedAt,
-            videoUrl: null
-          };
-        }
-      })
-    );
-    
-    // Paso 4: Retornar respuesta exitosa con todos los videos y sus URLs
+    const pool = await getPool();
+
+    // 🔥 Query CORREGIDA según tu tabla real
+    const result = await pool.request().query(`
+      SELECT 
+        id_video,
+        titulo,
+        descripcion,
+        blob_Name,
+        fecha_subida,
+        vistas
+      FROM videos
+      ORDER BY fecha_subida DESC
+    `);
+
+    const videos = result.recordset;
+
+    // 🔹 Transformación limpia
+    const data = videos.map(video => ({
+      videoId: video.id_video,
+      title: video.titulo,
+      description: video.descripcion,
+      views: video.vistas,
+      uploadedAt: video.fecha_subida,
+      videoUrl: buildVideoUrl(video.blob_Name)
+    }));
+
     return NextResponse.json({
       success: true,
-      data: videosWithUrls
+      count: data.length,
+      data
     });
-    
+
   } catch (error) {
-    console.error('Error general en GET /api/videos:', error);
-    return NextResponse.json(
-      {
+    console.error('❌ Error en GET /api/videos:', error);
+
+    // 🔴 Errores específicos útiles
+    if (error.code === 'ELOGIN') {
+      return NextResponse.json({
         success: false,
-        message: 'Error al obtener los videos'
-      },
-      { status: 500 }
-    );
+        message: 'Credenciales incorrectas de SQL Server'
+      }, { status: 500 });
+    }
+
+    if (error.code === 'ETIMEOUT') {
+      return NextResponse.json({
+        success: false,
+        message: 'Timeout: revisa firewall o red de Azure'
+      }, { status: 500 });
+    }
+
+    if (error.code === 'EREQUEST' && error.message.includes('Invalid object name')) {
+      return NextResponse.json({
+        success: false,
+        message: 'La tabla "videos" no existe'
+      }, { status: 500 });
+    }
+
+    return NextResponse.json({
+      success: false,
+      message: 'Error interno',
+      code: error.code,
+      error: error.message
+    }, { status: 500 });
   }
 }
